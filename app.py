@@ -5,7 +5,6 @@ from flask_cors import CORS
 import re
 import traceback
 import requests
-import os
 import isodate
 
 # Initialize Flask app
@@ -14,11 +13,6 @@ CORS(app)  # Enable CORS for all routes
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
-
-# YouTube API Key should be set as an environment variable
-# You'll need to get this from the Google Cloud Console
-YOUTUBE_API_KEY = "AIzaSyAuO1En3zp1WIhUeEp5WcHu5nyRUb8ooWU"
-
 
 def extract_video_id(url):
     """Extract the video ID from various YouTube URL formats"""
@@ -53,12 +47,22 @@ def extract_metadata():
         app.logger.error(f"Error parsing JSON: {e}")
         return jsonify({"error": f"Invalid JSON format: {str(e)}"}), 400
 
-    # Check if data exists and youtube_url is provided
-    if not data or not data.get("youtube_url"):
+    # Check if required parameters are provided
+    if not data:
+        app.logger.error("Invalid request: No data provided")
+        return jsonify({"error": "Request data is required"}), 400
+
+    if not data.get("youtube_url"):
         app.logger.error("Invalid request: 'youtube_url' is missing")
         return jsonify({"error": "'youtube_url' is required"}), 400
 
+    if not data.get("api_key"):
+        app.logger.error("Invalid request: 'api_key' is missing")
+        return jsonify({"error": "'api_key' is required"}), 400
+
     youtube_url = data.get("youtube_url")
+    api_key = data.get("api_key")
+    
     app.logger.info(f"Received YouTube URL: {youtube_url}")
 
     # Extract video ID directly from URL
@@ -70,8 +74,8 @@ def extract_metadata():
 
     try:
         # Use YouTube Data API to get video metadata
-        metadata = get_video_metadata(video_id)
-
+        metadata = get_video_metadata(video_id, api_key)
+        
         if "error" in metadata:
             return jsonify(metadata), 400
 
@@ -100,43 +104,43 @@ def extract_metadata():
         return jsonify({"error": str(e)}), 400
 
 
-def get_video_metadata(video_id):
+def get_video_metadata(video_id, api_key):
     """
     Fetch video metadata using YouTube Data API
     """
     app.logger.info(f"Fetching metadata for video ID: {video_id}")
-
+    
     try:
         # YouTube Data API v3 endpoint
         api_url = f"https://www.googleapis.com/youtube/v3/videos"
-
+        
         # Parameters for the API request
         params = {
             "part": "snippet,contentDetails,statistics",
             "id": video_id,
-            "key": YOUTUBE_API_KEY
+            "key": api_key
         }
-
+        
         response = requests.get(api_url, params=params)
         response.raise_for_status()  # Raise exception for non-200 status codes
-
+        
         data = response.json()
-
+        
         # Check if video data exists
         if not data.get("items"):
             return {"error": "Video not found or not accessible"}
-
+        
         video_data = data["items"][0]
-
+        
         # Extract relevant information
         snippet = video_data.get("snippet", {})
         content_details = video_data.get("contentDetails", {})
         statistics = video_data.get("statistics", {})
-
+        
         # Convert ISO 8601 duration to seconds
         duration_iso = content_details.get("duration", "PT0S")
         duration_seconds = int(isodate.parse_duration(duration_iso).total_seconds())
-
+        
         # Build metadata object
         metadata = {
             "video_id": video_id,
@@ -148,10 +152,10 @@ def get_video_metadata(video_id):
             "view_count": int(statistics.get("viewCount", 0)),
             "duration_seconds": duration_seconds
         }
-
+        
         app.logger.info("Successfully retrieved video metadata")
         return metadata
-
+        
     except requests.exceptions.RequestException as e:
         app.logger.error(f"Error making request to YouTube API: {e}")
         return {"error": f"YouTube API error: {str(e)}"}
