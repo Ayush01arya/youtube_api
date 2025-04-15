@@ -2,18 +2,27 @@ from flask import Flask, request, jsonify
 from pytube import YouTube
 from youtube_transcript_api import YouTubeTranscriptApi
 import logging
+from flask_cors import CORS
 
 # Initialize Flask app
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
 
-
-@app.route("/extract", methods=["POST"])
+@app.route("/api/extract", methods=["POST", "OPTIONS"])
 def extract_metadata():
+    # Handle preflight OPTIONS request
+    if request.method == "OPTIONS":
+        return "", 200
+        
     # Get JSON data from request
-    data = request.json
+    try:
+        data = request.get_json()
+    except Exception as e:
+        app.logger.error(f"Error parsing JSON: {e}")
+        return jsonify({"error": "Invalid JSON format"}), 400
 
     # Check if data exists and youtube_url is provided
     if not data or not data.get("youtube_url"):
@@ -59,6 +68,6 @@ def extract_metadata():
         app.logger.error(f"Error extracting video data: {e}")
         return jsonify({"error": str(e)}), 400
 
-
+# For local development
 if __name__ == "__main__":
     app.run(debug=True)
