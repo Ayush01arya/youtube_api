@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from youtube_transcript_api.formatters import TextFormatter
 import logging
 from flask_cors import CORS
 import re
@@ -8,6 +9,8 @@ import requests
 import os
 import isodate
 import json
+import random
+from http_request_randomizer.requests.proxy.requestProxy import RequestProxy
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -15,6 +18,34 @@ CORS(app)  # Enable CORS for all routes
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
+
+# Initialize proxy manager (only use when needed)
+proxy_manager = None
+
+def get_random_proxy():
+    """Get a random proxy from the proxy manager"""
+    global proxy_manager
+    
+    try:
+        if proxy_manager is None:
+            app.logger.info("Initializing proxy manager...")
+            proxy_manager = RequestProxy()
+        
+        proxies = proxy_manager.get_proxy_list()
+        if not proxies:
+            app.logger.warning("No proxies available")
+            return None
+        
+        proxy = random.choice(proxies)
+        proxy_dict = {
+            "http": f"http://{proxy.get_address()}",
+            "https": f"http://{proxy.get_address()}"
+        }
+        app.logger.info(f"Using proxy: {proxy.get_address()}")
+        return proxy_dict
+    except Exception as e:
+        app.logger.error(f"Error getting proxy: {e}")
+        return None
 
 def extract_video_id(url):
     """Extract the video ID from various YouTube URL formats"""
@@ -28,52 +59,73 @@ def extract_video_id(url):
         return match.group(6)
     return None
 
-def get_transcript(video_id):
+def get_transcript(video_id, use_proxy=True):
     """
-    Get transcript for a video with detailed error handling
+    Get transcript for a video with proxy support and detailed error handling
     Returns a dictionary with success status, transcript text and error details if any
     """
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        
-        # Try to get manually created transcript first
+        # First attempt without proxy
         try:
-            transcript = transcript_list.find_manually_created_transcript(['en'])
-            transcript_data = transcript.fetch()
+            app.logger.info(f"Attempting to get transcript directly for {video_id}")
+            transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
+            formatter = TextFormatter()
+            formatted_transcript = formatter.format_transcript(transcript_data)
+            
             return {
                 "success": True,
-                "transcript_text": " ".join([item['text'] for item in transcript_data]),
-                "transcript_type": "manual",
+                "transcript_text": formatted_transcript,
+                "transcript_type": "direct-api",
                 "transcript_details": [{"text": item['text'], "start": item['start'], "duration": item['duration']} for item in transcript_data]
             }
-        except Exception:
-            # Fall back to auto-generated transcript
-            try:
-                transcript = transcript_list.find_generated_transcript(['en'])
-                transcript_data = transcript.fetch()
-                return {
-                    "success": True,
-                    "transcript_text": " ".join([item['text'] for item in transcript_data]),
-                    "transcript_type": "auto-generated",
-                    "transcript_details": [{"text": item['text'], "start": item['start'], "duration": item['duration']} for item in transcript_data]
-                }
-            except Exception:
-                # Try any available language as a last resort
+        except Exception as direct_error:
+            app.logger.warning(f"Direct transcript fetch failed: {direct_error}")
+            
+            # If proxy usage is enabled and direct method failed
+            if use_proxy:
+                app.logger.info("Attempting to get transcript using proxy")
+                
+                # Try using an alternative method with proxies
                 try:
-                    transcript = transcript_list[0]
-                    transcript_data = transcript.fetch()
-                    return {
-                        "success": True,
-                        "transcript_text": " ".join([item['text'] for item in transcript_data]),
-                        "transcript_type": f"other-language ({transcript.language})",
-                        "transcript_details": [{"text": item['text'], "start": item['start'], "duration": item['duration']} for item in transcript_data]
-                    }
-                except Exception as e:
-                    return {
-                        "success": False,
-                        "error": f"Failed to get any transcript: {str(e)}",
-                        "transcript_text": "Transcript not available."
-                    }
+                    # Get lyrics from description as fallback (for music videos)
+                    app.logger.info("Checking if lyrics are in video description...")
+                    metadata = get_video_metadata(video_id, request.headers.get('X-API-Key'))
+                    description = metadata.get("description", "")
+                    
+                    # Basic check if description contains lyrics
+                    if "lyrics" in description.lower() and len(description) > 500:
+                        lyrics_section = extract_lyrics_from_description(description)
+                        if lyrics_section:
+                            return {
+                                "success": True,
+                                "transcript_text": lyrics_section,
+                                "transcript_type": "lyrics-from-description",
+                                "transcript_details": [{"text": lyrics_section, "start": 0, "duration": 0}]
+                            }
+                    
+                    # If no lyrics in description, try using proxy for transcript API
+                    proxy = get_random_proxy()
+                    if proxy:
+                        app.logger.info(f"Using proxy: {proxy}")
+                        # Note: Currently the YouTube Transcript API doesn't directly support proxies
+                        # This is a placeholder for implementing proxy support
+                        # You would need to modify the YouTubeTranscriptApi or use a different approach
+                        
+                        # As a fallback, let's try to fetch from a proxy-friendly alternative
+                        # This is where you would implement your proxy solution
+                        
+                        # Placeholder to show where proxy implementation would go
+                        raise NotImplementedError("Proxy support for transcripts requires custom implementation")
+                    else:
+                        raise Exception("No proxies available")
+                        
+                except Exception as proxy_error:
+                    app.logger.error(f"Proxy method failed: {proxy_error}")
+                    raise
+            else:
+                # Re-raise the original error if proxy not enabled
+                raise direct_error
+
     except TranscriptsDisabled:
         return {
             "success": False,
@@ -87,11 +139,79 @@ def get_transcript(video_id):
             "transcript_text": "Transcript not available: No transcript found for this video."
         }
     except Exception as e:
-        return {
-            "success": False,
-            "error": f"Error fetching transcript: {str(e)}",
-            "transcript_text": f"Transcript not available: {str(e)}"
-        }
+        # Add specific handling for IP blocking error
+        error_str = str(e)
+        if "blocked" in error_str.lower() or "ip" in error_str.lower():
+            return {
+                "success": False,
+                "error": "YouTube IP blocking detected. Consider using proxies or cookies as described in the YouTube Transcript API documentation.",
+                "transcript_text": f"Transcript not available: YouTube is blocking requests from your IP. Please use a different IP or implement a proxy solution.",
+                "alternative_options": [
+                    "1. Use a VPN or proxy service",
+                    "2. Implement the proxy solution from the YouTube Transcript API documentation",
+                    "3. For music videos, extract lyrics from the video description when available"
+                ]
+            }
+        else:
+            return {
+                "success": False,
+                "error": f"Error fetching transcript: {str(e)}",
+                "transcript_text": f"Transcript not available: {str(e)}"
+            }
+
+def extract_lyrics_from_description(description):
+    """Extract lyrics from video description"""
+    lines = description.split("\n")
+    lyrics_lines = []
+    in_lyrics_section = False
+    
+    # Look for patterns that typically indicate lyrics sections
+    for line in lines:
+        # Start of lyrics section indicators
+        if re.search(r'lyrics:|^lyrics$|^lyrics:$', line.lower().strip()):
+            in_lyrics_section = True
+            continue
+            
+        # End of lyrics section indicators (links, hashtags, etc.)
+        if in_lyrics_section and (line.startswith("http") or 
+                                line.startswith("#") or 
+                                "subscribe" in line.lower() or
+                                "follow" in line.lower()):
+            in_lyrics_section = False
+            
+        if in_lyrics_section and line.strip():
+            lyrics_lines.append(line)
+            
+    # If we didn't find a clearly marked lyrics section, try another approach
+    if not lyrics_lines:
+        # Look for verse-like patterns
+        verse_pattern = r'(verse|chorus|bridge|hook|outro|intro)[ 0-9]*:?'
+        for i, line in enumerate(lines):
+            if re.search(verse_pattern, line.lower()):
+                # Found a verse marker, extract the following lines
+                j = i
+                while j < len(lines) and j < i + 20:  # Limit to 20 lines after the marker
+                    if lines[j].strip() and not lines[j].startswith("http"):
+                        lyrics_lines.append(lines[j])
+                    j += 1
+    
+    # If we still don't have lyrics, look for consecutive short lines that might be lyrics
+    if not lyrics_lines:
+        consecutive_short_lines = 0
+        temp_lyrics = []
+        
+        for line in lines:
+            line = line.strip()
+            if line and len(line) < 100 and not line.startswith("http") and "#" not in line:
+                consecutive_short_lines += 1
+                temp_lyrics.append(line)
+            else:
+                if consecutive_short_lines >= 4:  # If we found at least 4 consecutive short lines
+                    lyrics_lines.extend(temp_lyrics)
+                consecutive_short_lines = 0
+                temp_lyrics = []
+    
+    return "\n".join(lyrics_lines) if lyrics_lines else ""
 
 @app.route("/api/extract", methods=["POST", "OPTIONS"])
 def extract_metadata():
@@ -126,6 +246,9 @@ def extract_metadata():
 
     youtube_url = data.get("youtube_url")
     app.logger.info(f"Received YouTube URL: {youtube_url}")
+    
+    # Check if proxy option is specified
+    use_proxy = data.get("use_proxy", True)
 
     # Extract video ID directly from URL
     video_id = extract_video_id(youtube_url)
@@ -143,7 +266,7 @@ def extract_metadata():
 
         # Get transcript with detailed error handling
         app.logger.info(f"Fetching transcript for video ID: {video_id}")
-        transcript_result = get_transcript(video_id)
+        transcript_result = get_transcript(video_id, use_proxy)
         
         # Add transcript info to metadata
         metadata["transcript_available"] = transcript_result["success"]
@@ -160,6 +283,10 @@ def extract_metadata():
         if transcript_result["success"] and "transcript_details" in transcript_result:
             result["transcript_details"] = transcript_result["transcript_details"]
             result["transcript_type"] = transcript_result["transcript_type"]
+        
+        # Add alternative options if available
+        if "alternative_options" in transcript_result:
+            result["alternative_options"] = transcript_result["alternative_options"]
 
         app.logger.info(f"Final metadata result: {json.dumps(metadata, indent=2)}")
         return jsonify(result)
@@ -253,6 +380,7 @@ def mindpal_extract():
             
         # Extract YouTube URL from input
         youtube_url = data.get("input")
+        use_proxy = data.get("use_proxy", True)
         
         # Extract video ID
         video_id = extract_video_id(youtube_url)
@@ -265,7 +393,7 @@ def mindpal_extract():
             return jsonify({"success": False, "error": metadata["error"]}), 400
             
         # Get transcript with improved error handling
-        transcript_result = get_transcript(video_id)
+        transcript_result = get_transcript(video_id, use_proxy)
             
         # Format response according to MindPal API structure
         result = {
@@ -284,6 +412,10 @@ def mindpal_extract():
             result["data"]["transcript_type"] = transcript_result["transcript_type"]
         elif not transcript_result["success"]:
             result["data"]["transcript_error"] = transcript_result["error"]
+            
+        # Add alternative options if available
+        if "alternative_options" in transcript_result:
+            result["data"]["alternative_options"] = transcript_result["alternative_options"]
         
         return jsonify(result)
         
