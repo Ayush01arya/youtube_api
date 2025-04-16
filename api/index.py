@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 import logging
 from flask_cors import CORS
 import re
@@ -7,6 +7,7 @@ import traceback
 import requests
 import os
 import isodate
+import json
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -26,6 +27,71 @@ def extract_video_id(url):
     if match:
         return match.group(6)
     return None
+
+def get_transcript(video_id):
+    """
+    Get transcript for a video with detailed error handling
+    Returns a dictionary with success status, transcript text and error details if any
+    """
+    try:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        
+        # Try to get manually created transcript first
+        try:
+            transcript = transcript_list.find_manually_created_transcript(['en'])
+            transcript_data = transcript.fetch()
+            return {
+                "success": True,
+                "transcript_text": " ".join([item['text'] for item in transcript_data]),
+                "transcript_type": "manual",
+                "transcript_details": [{"text": item['text'], "start": item['start'], "duration": item['duration']} for item in transcript_data]
+            }
+        except Exception:
+            # Fall back to auto-generated transcript
+            try:
+                transcript = transcript_list.find_generated_transcript(['en'])
+                transcript_data = transcript.fetch()
+                return {
+                    "success": True,
+                    "transcript_text": " ".join([item['text'] for item in transcript_data]),
+                    "transcript_type": "auto-generated",
+                    "transcript_details": [{"text": item['text'], "start": item['start'], "duration": item['duration']} for item in transcript_data]
+                }
+            except Exception:
+                # Try any available language as a last resort
+                try:
+                    transcript = transcript_list[0]
+                    transcript_data = transcript.fetch()
+                    return {
+                        "success": True,
+                        "transcript_text": " ".join([item['text'] for item in transcript_data]),
+                        "transcript_type": f"other-language ({transcript.language})",
+                        "transcript_details": [{"text": item['text'], "start": item['start'], "duration": item['duration']} for item in transcript_data]
+                    }
+                except Exception as e:
+                    return {
+                        "success": False,
+                        "error": f"Failed to get any transcript: {str(e)}",
+                        "transcript_text": "Transcript not available."
+                    }
+    except TranscriptsDisabled:
+        return {
+            "success": False,
+            "error": "Transcripts are disabled for this video",
+            "transcript_text": "Transcript not available: Transcripts are disabled for this video."
+        }
+    except NoTranscriptFound:
+        return {
+            "success": False,
+            "error": "No transcript found for this video",
+            "transcript_text": "Transcript not available: No transcript found for this video."
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Error fetching transcript: {str(e)}",
+            "transcript_text": f"Transcript not available: {str(e)}"
+        }
 
 @app.route("/api/extract", methods=["POST", "OPTIONS"])
 def extract_metadata():
@@ -75,23 +141,27 @@ def extract_metadata():
         if "error" in metadata:
             return jsonify(metadata), 400
 
-        # Attempt to get transcript
-        try:
-            app.logger.info(f"Fetching transcript for video ID: {video_id}")
-            transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
-            transcript_text = " ".join([item['text'] for item in transcript_data])
-            app.logger.info("Transcript fetched successfully")
-        except Exception as e:
-            app.logger.error(f"Error fetching transcript: {e}")
-            transcript_text = "Transcript not available."
+        # Get transcript with detailed error handling
+        app.logger.info(f"Fetching transcript for video ID: {video_id}")
+        transcript_result = get_transcript(video_id)
+        
+        # Add transcript info to metadata
+        metadata["transcript_available"] = transcript_result["success"]
+        if not transcript_result["success"]:
+            metadata["transcript_error"] = transcript_result["error"]
 
         # Prepare final result
         result = {
             "metadata": metadata,
-            "transcript": transcript_text
+            "transcript": transcript_result["transcript_text"]
         }
+        
+        # Add detailed transcript info if available
+        if transcript_result["success"] and "transcript_details" in transcript_result:
+            result["transcript_details"] = transcript_result["transcript_details"]
+            result["transcript_type"] = transcript_result["transcript_type"]
 
-        app.logger.info(f"Final metadata result: {metadata}")
+        app.logger.info(f"Final metadata result: {json.dumps(metadata, indent=2)}")
         return jsonify(result)
 
     except Exception as e:
@@ -194,22 +264,26 @@ def mindpal_extract():
         if "error" in metadata:
             return jsonify({"success": False, "error": metadata["error"]}), 400
             
-        # Get transcript
-        try:
-            transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
-            transcript_text = " ".join([item['text'] for item in transcript_data])
-        except Exception:
-            transcript_text = "Transcript not available."
+        # Get transcript with improved error handling
+        transcript_result = get_transcript(video_id)
             
         # Format response according to MindPal API structure
         result = {
             "success": True,
             "data": {
                 "metadata": metadata,
-                "transcript": transcript_text,
-                "source": youtube_url
+                "transcript": transcript_result["transcript_text"],
+                "source": youtube_url,
+                "transcript_available": transcript_result["success"]
             }
         }
+        
+        # Add transcript details if available
+        if transcript_result["success"] and "transcript_details" in transcript_result:
+            result["data"]["transcript_details"] = transcript_result["transcript_details"]
+            result["data"]["transcript_type"] = transcript_result["transcript_type"]
+        elif not transcript_result["success"]:
+            result["data"]["transcript_error"] = transcript_result["error"]
         
         return jsonify(result)
         
